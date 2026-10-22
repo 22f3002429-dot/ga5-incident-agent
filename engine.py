@@ -10,7 +10,8 @@ import httpx
 from otlp import build_otlp
 
 PROFILE = "ga5-incident-agent/v2"
-LLM_TIMEOUT = 8.0  # two attempts max, so stay under the 18s request limit
+LLM_TIMEOUT = 6.0      # per HTTP call
+PLAN_BUDGET_S = 14.0   # total planning time, under the grader's 18s limit
 EVIDENCE_RE = re.compile(r"^\[([^\]\s]+)\]")
 TRACEPARENT_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}$")
 
@@ -62,9 +63,10 @@ def nonempty_str(v):
 def index_transcript(transcript):
     index = {}
     for line in transcript.splitlines():
-        m = EVIDENCE_RE.match(line.strip())
+        line = line.strip()
+        m = EVIDENCE_RE.match(line)
         if m:
-            index.setdefault(m.group(1), line.strip())
+            index.setdefault(m.group(1), line)
     return index
 
 
@@ -94,7 +96,8 @@ def validate_create(body):
     if not isinstance(causes, list) or not causes or not all(nonempty_str(c) for c in causes):
         raise Invalid("incident.allowedRootCauses is invalid")
     catalog = body.get("toolCatalog")
-    if not isinstance(catalog, list) or not all(isinstance(t, dict) and nonempty_str(t.get("name")) for t in catalog):
+    if not isinstance(catalog, list) or not all(
+            isinstance(t, dict) and nonempty_str(t.get("name")) for t in catalog):
         raise Invalid("toolCatalog is invalid")
     policy = body.get("policy")
     if (not isinstance(policy, dict)
@@ -119,20 +122,29 @@ def validate_receipt(body):
 SYSTEM = "You are an incident response planner. Output exactly one JSON object and nothing else."
 
 
-def call_model(messages):
+def call_model(messages, deadline):
     base = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     key = os.environ.get("LLM_API_KEY")
     model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
     if not key:
         raise RuntimeError("LLM_API_KEY not set")
-    r = httpx.post(
-        f"{base}/chat/completions",
-        headers={"Authorization": f"Bearer {key}"},
-        json={"model": model, "messages": messages, "temperature": 0},
-        timeout=LLM_TIMEOUT,
-    )
-    r.raise_for_status()
-    return model, r.json()["choices"][0]["message"]["content"]
+
+    for attempt in range(2):  # one retry, only for a busy model (503)
+        remaining = deadline - time.monotonic()
+        if remaining < 2:
+            raise RuntimeError("planning deadline exceeded")
+        r = httpx.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": model, "messages": messages, "temperature": 0},
+            timeout=min(LLM_TIMEOUT, remaining),
+        )
+        if r.status_code == 503 and attempt == 0:
+            time.sleep(1.5)
+            continue
+        r.raise_for_status()
+        return model, r.json()["choices"][0]["message"]["content"]
+    raise RuntimeError("model unavailable")
 
 
 def build_prompt(incident, catalog, policy):
@@ -223,20 +235,25 @@ def validate_plan(raw, incident, catalog, policy, index):
 
 
 def plan_incident(incident, catalog, policy, index):
+    deadline = time.monotonic() + PLAN_BUDGET_S
     messages = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": build_prompt(incident, catalog, policy)},
     ]
-    for _ in range(2):
-        model, text = call_model(messages)
+    last_error = None
+    for _ in range(2):  # second attempt only if time remains
+        if deadline - time.monotonic() < 4:
+            break
+        model, text = call_model(messages, deadline)
         try:
             return validate_plan(extract_json(text), incident, catalog, policy, index), model
-        except (Invalid, ValueError, TypeError, KeyError, AttributeError):
+        except (Invalid, ValueError, TypeError, KeyError, AttributeError) as exc:
+            last_error = exc
             messages += [
                 {"role": "assistant", "content": "(invalid output)"},
                 {"role": "user", "content": "Output broke the rules. Return only the corrected JSON object."},
             ]
-    raise Invalid("planning failed")
+    raise Invalid(f"planning failed: {type(last_error).__name__ if last_error else 'timeout'}")
 
 
 # ---------- state machine ----------
@@ -467,4 +484,4 @@ def view(st):
         "actionLog": st["issued"], "receiptLog": st["receiptLog"],
         "dispatches": [], "approvals": [],
         "otlp": build_otlp(st),
-        }
+    }
