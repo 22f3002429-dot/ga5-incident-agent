@@ -11,6 +11,21 @@ from fastapi.responses import JSONResponse
 import engine
 
 log = logging.getLogger("ga5")
+logging.basicConfig(level=logging.INFO)
+
+
+def log_config():
+    for name in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL", "DB_PATH"):
+        value = os.environ.get(name)
+        if value is None:
+            log.info("env %s: MISSING", name)
+        elif name == "LLM_API_KEY":
+            log.info("env %s: set (length %d)", name, len(value))
+        else:
+            log.info("env %s: set, value=%r", name, value)
+
+
+log_config()
 
 DB_PATH = os.environ.get("DB_PATH", "incidents.db")
 LOCK = threading.Lock()
@@ -32,6 +47,30 @@ async def read_json(request):
         return await request.json()
     except Exception:
         return None
+
+
+@app.get("/debug/model")
+def debug_model():
+    # Temporary test route. Remove before grading.
+    # Reports only status and the model's short reply. Never returns the key.
+    base = os.environ.get("LLM_BASE_URL", "")
+    model = os.environ.get("LLM_MODEL", "")
+    try:
+        _, text = engine.call_model([
+            {"role": "user", "content": 'Reply with exactly {"ok":true}'}
+        ])
+        return {"ok": True, "base": base, "model": model, "reply": text[:200]}
+    except httpx.HTTPStatusError as exc:
+        return JSONResponse({
+            "ok": False, "base": base, "model": model,
+            "status": exc.response.status_code,
+            "model_error": exc.response.text[:300],
+        }, status_code=200)
+    except Exception as exc:
+        return JSONResponse({
+            "ok": False, "base": base, "model": model,
+            "error": type(exc).__name__,
+        }, status_code=200)
 
 
 @app.post("/v2/incidents")
@@ -61,9 +100,11 @@ async def create_incident(request: Request):
         except engine.Invalid as exc:
             return fail(422, str(exc))
         except httpx.HTTPStatusError as exc:
+            log.warning("model HTTP %s", exc.response.status_code)
             return JSONResponse(
                 {"error": "planning unavailable; retry later",
-                 "detail": f"model HTTP {exc.response.status_code}"},
+                 "detail": f"model HTTP {exc.response.status_code}",
+                 "model_error": exc.response.text[:300]},
                 status_code=503)
         except Exception as exc:
             log.exception("planning failed")
