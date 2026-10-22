@@ -1,12 +1,16 @@
 import json
+import logging
 import os
 import sqlite3
 import threading
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 import engine
+
+log = logging.getLogger("ga5")
 
 DB_PATH = os.environ.get("DB_PATH", "incidents.db")
 LOCK = threading.Lock()
@@ -56,8 +60,17 @@ async def create_incident(request: Request):
             )
         except engine.Invalid as exc:
             return fail(422, str(exc))
-        except Exception:
-            return fail(503, "planning unavailable; retry later")
+        except httpx.HTTPStatusError as exc:
+            return JSONResponse(
+                {"error": "planning unavailable; retry later",
+                 "detail": f"model HTTP {exc.response.status_code}"},
+                status_code=503)
+        except Exception as exc:
+            log.exception("planning failed")
+            return JSONResponse(
+                {"error": "planning unavailable; retry later",
+                 "detail": type(exc).__name__},
+                status_code=503)
         DB.execute("INSERT INTO runs (run_id, req_hash, state) VALUES (?, ?, ?)",
                    (run_id, req_hash, json.dumps(state)))
         DB.commit()
